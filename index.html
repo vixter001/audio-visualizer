@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html>
+<body style="margin:0;background:#000;overflow:hidden;font-family:system-ui,sans-serif">
+<canvas id="c"></canvas>
+
+<div style="position:fixed;top:10px;left:10px;display:flex;gap:8px;align-items:center">
+  <button id="mic">Use microphone</button>
+  <label style="background:#fff;padding:6px 10px;cursor:pointer;border-radius:4px">
+    Load WAV / MP3
+    <input type="file" id="file" accept=".wav,.mp3,audio/wav,audio/mpeg" hidden>
+  </label>
+</div>
+<div id="status" style="position:fixed;top:48px;left:10px;color:#ccc;font-size:14px"></div>
+
+<div id="peak" style="position:fixed;top:10px;right:10px;color:#fff;font:18px monospace"></div>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+function resize() { canvas.width = innerWidth; canvas.height = innerHeight; }
+resize();
+addEventListener('resize', resize);
+
+const COLUMNS = 64;
+//colors
+const HUE_START = 230;   // blue
+const HUE_END = 450;     // yellow (wraps the long way round through red)
+
+//low cut
+const LOW_CUT = 0.9; //sensitivity of the lowest column (0 = silent, 1 = no change)
+const weights = new Float32Array(COLUMNS);
+for (let c = 0; c < COLUMNS; c++){
+    weights[c] = LOW_CUT + (1 - LOW_CUT) * (c / (COLUMNS - 1));
+}
+
+//smaller y axis of frequencies
+const BIN_MIN = 1;     // lowest bin shown (about 190 Hz at 48 kHz)
+const BIN_MAX = 120;   // highest bin shown (about 4.6 kHz at 48 kHz)
+
+const GRAVITY = 0.4;
+const particles = [];
+const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+
+//loudest frequency to note value
+function hzToNote(hz) {
+  const midi = Math.round(69 + 12 * Math.log2(hz / 440));   // nearest semitone
+  const name = NOTE_NAMES[midi % 12];                          // C, C#, … B
+  const octave = Math.floor(midi / 12) - 1;                   // C4 = MIDI 60
+  return name + octave;
+}
+
+
+let audioCtx, analyser, data;
+let current = null;        // the active source node (a file player or the mic)
+let currentStream = null;  // the mic stream, kept so we can release it
+let running = false;
+
+//update label less frequently
+let frameCount = 0;
+const PEAK_EVERY = 5;   // update the label every x frames
+
+const statusEl = document.getElementById('status');
+function setStatus(msg) { statusEl.textContent = msg; }
+
+// Create the audio engine once, on first use
+function setupAudio() {
+  if (audioCtx) return;
+  audioCtx = new AudioContext();
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 1024;                           // 512 frequency bins
+  
+  data = new Uint8Array(analyser.frequencyBinCount);
+
+  // Filtered branch, used only for the note label
+  const highpass = audioCtx.createBiquadFilter();
+  highpass.type = 'highpass';
+  highpass.frequency.value = 200;      // remove everything below 200 Hz
+
+  labelAnalyser = audioCtx.createAnalyser();
+  labelAnalyser.fftSize = 4096;        // finer bins (about 11.7 Hz) for picking out notes
+  labelData = new Uint8Array(labelAnalyser.frequencyBinCount);
+
+  analyser.connect(highpass);          // analyser passes audio through to the filter
+  highpass.connect(labelAnalyser);
+}
+
+// Disconnect whatever is currently feeding the analyser
+function stopCurrent() {
+  if (current) {
+    if (current.stop) current.stop();                // only file players have stop()
+    current.disconnect();
+    current = null;
+  }
+  if (currentStream) {
+    currentStream.getTracks().forEach(t => t.stop()); // turn off the mic light
+    currentStream = null;
+  }
+}
+
+async function useMicrophone() {
+  setupAudio();
+  await audioCtx.resume();
+  stopCurrent();
+  currentStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  current = audioCtx.createMediaStreamSource(currentStream);
+  current.connect(analyser);   // not connected to speakers, so no feedback
+  setStatus('Listening to microphone');
+  start();
+}
+
+async function loadFile(file) {
+  setupAudio();
+  await audioCtx.resume();
+  stopCurrent();
+  setStatus('Decoding ' + file.name + '…');
+
+  // Decode the whole file into PCM samples. The browser handles WAV and MP3.
+  const buffer = await audioCtx.decodeAudioData(await file.arrayBuffer());
+
+  const player = audioCtx.createBufferSource();
+  player.buffer = buffer;
+  player.loop = true;
+  player.connect(analyser);            // feeds the visualizer
+  player.connect(audioCtx.destination); // lets you hear the file
+  player.start();
+
+  current = player;
+  setStatus('Playing ' + file.name);
+  start();
+}
+
+function showError(err) { setStatus('Error: ' + err.message); }
+
+document.getElementById('mic').onclick = () => useMicrophone().catch(showError);
+
+document.getElementById('file').onchange = e => {
+  const file = e.target.files[0];
+  if (file) loadFile(file).catch(showError);
+  e.target.value = '';   // lets you pick the same file again
+};
+
+const peakEl = document.getElementById('peak');
+
+function updatePeak() { //updating the note label top right
+  labelAnalyser.getByteFrequencyData(labelData);
+
+  let peakBin = 0, peakVal = 0;
+  for (let b = 1; b < labelData.length; b++) {    // start at 1 to skip the DC offset in bin 0
+    if (labelData[b] > peakVal) {
+      peakVal = labelData[b];
+      peakBin = b;
+    }
+  }
+  const hz = peakBin * audioCtx.sampleRate / labelAnalyser.fftSize;
+  peakEl.textContent = peakVal > 20 ? `${hzToNote(hz)}  (${Math.round(hz)} Hz)` : '—';
+}
+
+
+function start() {
+  if (!running) { running = true; requestAnimationFrame(loop); }
+}
+
+function loop(now) {
+  requestAnimationFrame(loop);
+  analyser.getByteFrequencyData(data);
+
+
+  if (frameCount++ % PEAK_EVERY === 0) {
+    updatePeak();
+  }
+
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.2)';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  const colWidth = canvas.width / COLUMNS;
+
+  // Step A: spawn particles from each frequency column
+  for (let c = 0; c < COLUMNS; c++) {
+    const lo = Math.floor(BIN_MIN * Math.pow(BIN_MAX/BIN_MIN, c / COLUMNS));
+    const hi = Math.max(lo + 1, Math.floor(BIN_MIN * Math.pow(BIN_MAX/BIN_MIN, (c + 1) / COLUMNS)));
+
+    let amp = 0;
+    for (let b = lo; b < hi; b++) amp = Math.max(amp, data[b]);
+    amp = (amp / 255) * weights[c]; //applies frequency weight of low cut
+
+    const count = amp > 0.5 ? Math.floor((amp - 0.5) * 4) : 0;
+    for (let i = 0; i < count; i++) {
+      particles.push({
+        x: c * colWidth + colWidth / 2,
+        y: canvas.height,
+        vx: (Math.random() - 0.5) * 0.5,
+        vy: -(1 + amp * 18),
+        hue: HUE_START + (c / COLUMNS) * (HUE_END - HUE_START),
+        amp: amp,
+        age: 0, 
+        maxAge: 120
+      });
+    }
+  }
+
+  // Step B: move with gravity, then draw
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.vx *= 0.99;
+    p.x += p.vx;
+    p.y += p.vy;
+    p.vy += GRAVITY;
+
+    if (p.y >= canvas.height) {
+      particles.splice(i, 1);
+      continue;
+    }
+
+    //color/opacity
+    p.age++;
+    const alpha = Math.max(0, 1 - p.age / p.maxAge);   // 1 when born, 0 when fully faded
+    if (alpha <= 0) { particles.splice(i, 1); continue; }
+
+    const sat = 40 + p.amp * 60;
+    const light = 35 + p.amp * 25;
+    ctx.fillStyle = `hsla(${p.hue % 360}, ${sat}%, ${light}%, ${alpha})`;
+    
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, 1.5, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+</script>
+</body>
+</html>
